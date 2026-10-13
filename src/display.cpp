@@ -63,12 +63,10 @@ const TRMNL_DEVICE device_list[] =
   "reterminal_e1001", 7, 9,     10,  12,   11,  13,   0xff, 0xff, 3,     1,    21,      BATT_ADC,  EPD_75,
   "reterminal_e1002", 7, 9,     10,  12,   11,  13,   0xff, 0xff, 3,     1,    21,      BATT_ADC,  EPD_75_6CLR,
   "crowpanel42",   0,    0,     0,   0,    0,   0,    0xff, 0xff, 2,     0xff, 0xff,    BATT_NONE, EPD_CROWPANEL, 
-#ifdef CMD_CS1_CS2
   "m5_paper_mono", 0,    0,     0,   0,    0,   0,    47,   48,   2,     0xff, 0xff,    BATT_NONE, EPD_PAPER_MONO, 
   "m5_paper_color", 0,   0,     0,   0,    0,   0,    3,    2,    1,     0xff, 0xff,    BATT_NONE, EPD_PAPER_COLOR, 
   "reterminal_e1004", 0, 0,     0,   0,    0,   0,    0xff, 0xff, 4,     1,    21,      BATT_ADC,  EPD_133_COLOR,
   "trmnl_steam",   7,    8,     6,   10,   5,   4,    21,   20,   2,     3,    0xff,    BATT_ADC,  EPD_583,
-#endif
   NULL,            0,    0,     0,   0,    0,   0,    0,    0,    0,     0,    0,       0,         0,
 }; // device_list
 
@@ -82,13 +80,11 @@ const DISPLAY_PROFILE dpList[12][3] = { // 1-bit and 2-bit display types for eac
     {{EP75YR_800x480, EP75YR_800x480}, {EP75YR_800x480, EP75YR_800x480}, {EP75YR_800x480, EP75YR_800x480}}, 
     {{EP73_SPECTRA_800x480, EP73_SPECTRA_800x480}, {EP73_SPECTRA_800x480, EP73_SPECTRA_800x480}, {EP73_SPECTRA_800x480, EP73_SPECTRA_800x480}},
     {{EPD_CROWPANEL42, EPD_CROWPANEL42_4GRAY},{EPD_CROWPANEL42, EPD_CROWPANEL42_4GRAY},{EPD_CROWPANEL42, EPD_CROWPANEL42_4GRAY}},
-#ifdef CMD_CS1_CS2
     {{EP583_648x480, EP583_648x480_4GRAY}, {EP583_648x480, EP583_648x480_4GRAY}, {EP583_648x480, EP583_648x480_4GRAY}},
     {{EPD_M5_PAPER_MONO, EPD_M5_PAPER_MONO_4GRAY},{EPD_M5_PAPER_MONO, EPD_M5_PAPER_MONO_4GRAY},{EPD_M5_PAPER_MONO, EPD_M5_PAPER_MONO_4GRAY}},
     {{EPD_M5_PAPER_COLOR, EPD_M5_PAPER_COLOR},{EPD_M5_PAPER_COLOR, EPD_M5_PAPER_COLOR},{EPD_M5_PAPER_COLOR, EPD_M5_PAPER_COLOR}},
     {{EPD_SEEED_E1004, EPD_SEEED_E1004},{EPD_SEEED_E1004, EPD_SEEED_E1004},{EPD_SEEED_E1004, EPD_SEEED_E1004}},
     {{EP368_792x528, EP368_792x528_4GRAY}, {EP368_792x528, EP368_792x528_4GRAY}, {EP368_792x528, EP368_792x528_4GRAY}},
-#endif
 };
 uint8_t u8SpectraPal[512]; // RGB333 mapped to closest Spectra6 color
 #endif // !PARALLEL_EPD
@@ -131,6 +127,7 @@ extern BQ27427 lipo; // Use lipo.[] to interact with the library in an Arduino
 #include <inttypes.h>
 #include <trmnl_log.h>
 #include "png_flip.h"
+#include "bmp.h"
 #include "fonts/nicoclean_8.h"
 #include "fonts/Inter_18.h"
 #include "fonts/Roboto_Black_24.h"
@@ -278,9 +275,15 @@ void display_init(void)
     pinMode(10, OUTPUT); // SD card enable (if it's powered down, the SPI bus may be blocked)
     digitalWrite(10, 1);
 #endif // BOARD_SEEED_STICKY
-    // Read the panel ID after any board-specific power/CS setup, but before bb_epaper takes over the SPI pins
-    panel_rev = get_panel_rev();
-    Log_info("Panel ID = 0x%08x\n", panel_rev);
+    // Read the panel ID after any board-specific power/CS setup, but before bb_epaper takes over the SPI pins.
+    // Only on the first call: the bit-banged read detaches SCK/MOSI from the SPI peripheral, and
+    // SPI.begin() is a no-op once the bus is running, so a second read would leave the panel unreachable.
+    static bool panel_rev_read = false;
+    if (!panel_rev_read) {
+        panel_rev = get_panel_rev();
+        panel_rev_read = true;
+        Log_info("Panel ID = 0x%08x\n", panel_rev);
+    }
     if (pDevice->epd_mosi_pin != 0 || pDevice->epd_sck_pin != 0) {
         bbep.setPanelType(dpList[pDevice->panel_set][iTempProfile].OneBit); // must be set BEFORE calling initio
         bbep.initIO(pDevice->epd_dc_pin, pDevice->epd_rst_pin, pDevice->epd_busy_pin, pDevice->epd_cs_pin,
@@ -697,46 +700,178 @@ uint16_t display_width()
 #ifdef PARALLEL_EPD
 void display_draw_touchbar_indicator(touchbar_side_t side, bool filled)
 {
+    display_draw_touchbar_progress(side, filled ? 1.0f : 0.0f);
+}
+
+// partialUpdate() only sends hardware refresh commands where the software
+// previousBuffer/currentBuffer actually differ - it has no idea the physical
+// panel still shows a stale full-color/grayscale image underneath (e-paper
+// keeps its last image through deep sleep; fillScreen() below only touches
+// the software buffer, never the panel). The very first indicator drawn each
+// boot gets a real diff for free from the mode-switch block below, so its
+// region gets correctly cleared - but a second (or third) indicator, drawn
+// moments later in the same boot with prev_mode already BB_MODE_1BPP, would
+// otherwise be judged "unchanged" against that same white software baseline
+// and never get a hardware command for its own region at all, leaving the
+// old image showing through. So every side gets this same forced-diff
+// treatment on its own first draw, not just whichever side happens to draw
+// first - tracked here so both the single- and dual-side entry points share
+// one seeded/not-yet-seeded record per side.
+static bool touchbar_side_seeded[3] = { false, false, false };
+#endif // BOARD_X_CLASS
+
+// Outline is always black with a white ring inset from it; the content area inside the ring
+// fills left-to-right in black as progress goes 0.0 -> 1.0. Only TRMNL X has a touchbar.
+void display_draw_touchbar_progress(touchbar_side_t side, float progress)
+{
+#ifdef BOARD_X_CLASS
     const int radius = 24;
-    const int margin_bottom = 20;
+    const int margin_bottom = 52;
     int w = bbep.width();
     int h = bbep.height();
     int x;
-    Log_info("Drawing touchbar indicator %d\n", (int)side);
+    Log_info("Drawing touchbar indicator %d, progress %d%%\n", (int)side, (int)(progress * 100));
     switch (side) {
         case TOUCHBAR_LEFT:   x = w / 6;     break;
         case TOUCHBAR_MIDDLE: x = w / 2;     break;
         case TOUCHBAR_RIGHT:  x = w * 5 / 6; break;
         default: return;
     }
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
     int y = h - margin_bottom - radius;
     int prev_mode = bbep.getPreviousMode();
-        const int rect_h = radius * 2;
-        const int rect_w = rect_h * 4;
-        const int border = 3;
-        int rx = x - rect_w / 2;
-        int ry = y - rect_h / 2;
-        uint8_t fill_color   = filled ? BBEP_BLACK : BBEP_WHITE;
-        uint8_t border_color = filled ? BBEP_WHITE : BBEP_BLACK;
-        if (prev_mode == BB_MODE_NONE) {
-            bbep.setMode(BB_MODE_1BPP);
-            // No previous image, so in order to get what we need in a partial update, we need to
-            // set the colors to the opposite of what we want drawn.
-            bbep.fillScreen(BBEP_WHITE);
-            bbep.drawRect(rx - border - 1, ry - border - 1, rect_w + 2 + (2*border), rect_h + 2 + (2*border), border_color);
-            bbep.fillRect(rx - border, ry - border, rect_w + (2*border), rect_h + (2*border), fill_color);
-            bbep.fillRect(rx, ry, rect_w, rect_h, border_color);
-            int sz = bbep.width() * bbep.height() / 8; // 1-bit per pixel
-            memcpy(bbep.previousBuffer(), bbep.currentBuffer(), sz);
-            bbep.setPreviousMode(BB_MODE_1BPP);
+    const int rect_h = radius * 2;
+    const int rect_w = rect_h * 4;
+    const int ring = 3;   // white ring inset from the outline
+    const int border = 3; // black outline thickness
+    int rx = x - rect_w / 2;
+    int ry = y - rect_h / 2;
+    int fill_w = (int)(rect_w * progress);
+    if (prev_mode == BB_MODE_NONE) {
+        bbep.setMode(BB_MODE_1BPP);
+        bbep.fillScreen(BBEP_WHITE);
+        int sz = bbep.width() * bbep.height() / 8; // 1-bit per pixel
+        memcpy(bbep.previousBuffer(), bbep.currentBuffer(), sz);
+        bbep.setPreviousMode(BB_MODE_1BPP);
+    }
+    if (!touchbar_side_seeded[side]) {
+        touchbar_side_seeded[side] = true;
+        // Seed with the exact per-pixel inverse of what we're about to draw
+        // (border, ring, and the fill boundary all flipped) so the real draw
+        // right after always produces a full diff for partialUpdate() to
+        // push, no matter what progress this first draw for this side uses.
+        bbep.fillRect(rx - ring - border, ry - ring - border, rect_w + 2*(ring+border), rect_h + 2*(ring+border), BBEP_WHITE);
+        bbep.fillRect(rx - ring, ry - ring, rect_w + (2*ring), rect_h + (2*ring), BBEP_BLACK);
+        bbep.fillRect(rx, ry, rect_w, rect_h, BBEP_WHITE);
+        if (fill_w < rect_w) {
+            bbep.fillRect(rx + fill_w, ry, rect_w - fill_w, rect_h, BBEP_BLACK);
         }
-        // Draw outline, then larger filled rect for border color and inner for fill color
-        bbep.drawRect(rx - border - 1, ry - border - 1, rect_w + 2 + (2*border), rect_h + 2 + (2*border), fill_color);
-        bbep.fillRect(rx - border, ry - border, rect_w + (2*border), rect_h + (2*border), border_color);
-        bbep.fillRect(rx, ry, rect_w, rect_h, fill_color);
-        bbep.partialUpdate(false);
-} /* display_draw_touchbar_indicator() */
-#endif
+        int sz = bbep.width() * bbep.height() / 8;
+        memcpy(bbep.previousBuffer(), bbep.currentBuffer(), sz);
+    }
+    // Outline stays black, ring stays white; content area is white with a black progress bar growing from the left
+    bbep.fillRect(rx - ring - border, ry - ring - border, rect_w + 2*(ring+border), rect_h + 2*(ring+border), BBEP_BLACK);
+    bbep.fillRect(rx - ring, ry - ring, rect_w + (2*ring), rect_h + (2*ring), BBEP_WHITE);
+    if (fill_w > 0) {
+        bbep.fillRect(rx, ry, fill_w, rect_h, BBEP_BLACK);
+    }
+    bbep.partialUpdate(true); // avoid the costly power-cycle each call
+#endif // BOARD_X_CLASS
+}
+
+// Draws two touchbar pills (both corners during a corner-hold gesture) in a
+// single partialUpdate() pass, so they visibly update simultaneously instead
+// of one after another - display_draw_touchbar_progress() calls
+// partialUpdate() internally on every call, so calling it twice in a row for
+// two different sides produces two separate physical refresh passes with a
+// visible stagger between them. Only TRMNL X has a touchbar.
+void display_draw_touchbar_progress_pair(touchbar_side_t side_a, float progress_a, touchbar_side_t side_b, float progress_b)
+{
+#ifdef BOARD_X_CLASS
+    const int radius = 24;
+    const int margin_bottom = 52;
+    int w = bbep.width();
+    int h = bbep.height();
+    Log_info("Drawing touchbar indicator pair %d/%d, progress %d%%\n", (int)side_a, (int)side_b, (int)(progress_a * 100));
+    if (progress_a < 0.0f) progress_a = 0.0f;
+    if (progress_a > 1.0f) progress_a = 1.0f;
+    if (progress_b < 0.0f) progress_b = 0.0f;
+    if (progress_b > 1.0f) progress_b = 1.0f;
+    int y = h - margin_bottom - radius;
+    const int rect_h = radius * 2;
+    const int rect_w = rect_h * 4;
+    const int ring = 3;   // white ring inset from the outline
+    const int border = 3; // black outline thickness
+    int ry = y - rect_h / 2;
+
+    int x_a, x_b;
+    switch (side_a) {
+        case TOUCHBAR_LEFT:   x_a = w / 6;     break;
+        case TOUCHBAR_MIDDLE: x_a = w / 2;     break;
+        case TOUCHBAR_RIGHT:  x_a = w * 5 / 6; break;
+        default: return;
+    }
+    switch (side_b) {
+        case TOUCHBAR_LEFT:   x_b = w / 6;     break;
+        case TOUCHBAR_MIDDLE: x_b = w / 2;     break;
+        case TOUCHBAR_RIGHT:  x_b = w * 5 / 6; break;
+        default: return;
+    }
+    int rx_a = x_a - rect_w / 2;
+    int rx_b = x_b - rect_w / 2;
+    int fill_w_a = (int)(rect_w * progress_a);
+    int fill_w_b = (int)(rect_w * progress_b);
+
+    if (bbep.getPreviousMode() == BB_MODE_NONE) {
+        bbep.setMode(BB_MODE_1BPP);
+        bbep.fillScreen(BBEP_WHITE);
+        int sz = bbep.width() * bbep.height() / 8; // 1-bit per pixel
+        memcpy(bbep.previousBuffer(), bbep.currentBuffer(), sz);
+        bbep.setPreviousMode(BB_MODE_1BPP);
+    }
+    // Both sides' seed patterns must land in currentBuffer before the single
+    // shared memcpy() below - seeding one side, syncing previousBuffer, then
+    // seeding the other would sync away the first side's still-pending real
+    // draw before it ever gets pushed. See display_draw_touchbar_progress()
+    // for why this forced-diff seed is needed at all.
+    bool need_seed_a = !touchbar_side_seeded[side_a];
+    bool need_seed_b = !touchbar_side_seeded[side_b];
+    if (need_seed_a || need_seed_b) {
+        if (need_seed_a) {
+            touchbar_side_seeded[side_a] = true;
+            bbep.fillRect(rx_a - ring - border, ry - ring - border, rect_w + 2*(ring+border), rect_h + 2*(ring+border), BBEP_WHITE);
+            bbep.fillRect(rx_a - ring, ry - ring, rect_w + (2*ring), rect_h + (2*ring), BBEP_BLACK);
+            bbep.fillRect(rx_a, ry, rect_w, rect_h, BBEP_WHITE);
+            if (fill_w_a < rect_w) {
+                bbep.fillRect(rx_a + fill_w_a, ry, rect_w - fill_w_a, rect_h, BBEP_BLACK);
+            }
+        }
+        if (need_seed_b) {
+            touchbar_side_seeded[side_b] = true;
+            bbep.fillRect(rx_b - ring - border, ry - ring - border, rect_w + 2*(ring+border), rect_h + 2*(ring+border), BBEP_WHITE);
+            bbep.fillRect(rx_b - ring, ry - ring, rect_w + (2*ring), rect_h + (2*ring), BBEP_BLACK);
+            bbep.fillRect(rx_b, ry, rect_w, rect_h, BBEP_WHITE);
+            if (fill_w_b < rect_w) {
+                bbep.fillRect(rx_b + fill_w_b, ry, rect_w - fill_w_b, rect_h, BBEP_BLACK);
+            }
+        }
+        int sz = bbep.width() * bbep.height() / 8;
+        memcpy(bbep.previousBuffer(), bbep.currentBuffer(), sz);
+    }
+    bbep.fillRect(rx_a - ring - border, ry - ring - border, rect_w + 2*(ring+border), rect_h + 2*(ring+border), BBEP_BLACK);
+    bbep.fillRect(rx_a - ring, ry - ring, rect_w + (2*ring), rect_h + (2*ring), BBEP_WHITE);
+    if (fill_w_a > 0) {
+        bbep.fillRect(rx_a, ry, fill_w_a, rect_h, BBEP_BLACK);
+    }
+    bbep.fillRect(rx_b - ring - border, ry - ring - border, rect_w + 2*(ring+border), rect_h + 2*(ring+border), BBEP_BLACK);
+    bbep.fillRect(rx_b - ring, ry - ring, rect_w + (2*ring), rect_h + (2*ring), BBEP_WHITE);
+    if (fill_w_b > 0) {
+        bbep.fillRect(rx_b, ry, fill_w_b, rect_h, BBEP_BLACK);
+    }
+    bbep.partialUpdate(true); // avoid the costly power-cycle each call
+#endif // BOARD_X_CLASS
+}
 
 /**
  * @brief Function to draw multi-line text onto the display
@@ -769,7 +904,10 @@ int iWidthLimit = (max_width * 3)/4; // don't let the text go all the way to the
         bbep.getStringBox(szTemp, &rect);
         if (c == 0 || c == '\n' || (c == ' ' && rect.w >= iWidthLimit) || d == &szTemp[sizeof(szTemp) - 1]) {
             if (c == 0 || s[0] == 0) bDone = true;
-            if (c == ' ' || c == '\n') d[-1] = 0; // don't print the space/newline
+            if (c == ' ' || c == '\n') {
+                d[-1] = 0; // don't print the space/newline
+                bbep.getStringBox(szTemp, &rect); // and don't center it either
+            }
             // Display the current partial string
             bbep.setCursor(x_start + (max_width - rect.w) / 2, -1);
             bbep.println(szTemp);
@@ -824,7 +962,7 @@ void ReduceBpp(int iDestBpp, int iPixelType, uint8_t *pPalette, uint8_t *pSrc, u
                         pPal = &pPalette[(s[0] & 0xf) * 3];
                         g = (pPal[0] + pPal[1]*2 + pPal[2])/4;
                     } else {
-                        g = (s[0] & 0xf) | (s[0] << 4);
+                        g = (s[0] & 0xf) | ((s[0] & 0xf) << 4); // the low nibble only: g is an int
                     }
                     s++;
                 } else {
@@ -1229,9 +1367,9 @@ int png_draw(PNGDRAW *pDraw)
             uint32_t u32Gray0, u32Gray1;
             u32Gray0 = pDraw->pPalette[0] + (pDraw->pPalette[1]<<2) + pDraw->pPalette[2];
             u32Gray1 = pDraw->pPalette[3] + (pDraw->pPalette[4]<<2) + pDraw->pPalette[5];
-          if (u32Gray0 < u32Gray1) {
-            ucInvert = 0xff;
-          }
+            if (u32Gray0 > u32Gray1) { // index 0 is the brighter color; output needs 0 = black
+                ucInvert = 0xff;
+            }
         } else {
             // Reduce the source image to 1-bpp or 2-bpp
             ReduceBpp((pDraw->pUser) ? 2:1, pDraw->iPixelType, pDraw->pPalette, pDraw->pPixels, pTemp, iWidth, pDraw->iBpp);
@@ -1779,6 +1917,7 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait, bool b
             // G5 compressed image
             BB_BITMAP *pBBB = (BB_BITMAP *)image_buffer;
 #ifdef BB_EPAPER
+            bbep.setMemoryMode(BB_MODE_1BPP); // use 1-bit mode to save memory
             if (bbep.allocBuffer(false) != BBEP_SUCCESS) {
                 Log_info("Error allocating bb_epaper frame buffer");
                 return;
@@ -1819,15 +1958,17 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait, bool b
         else
         {
          // This work-around is due to a lack of RAM; the correct method would be to use loadBMP()
-            flip_image(image_buffer+62, bbep.width(), bbep.height(), false); // fix bottom-up bitmap images
+            const int iBmpWidth = image_buffer[18] | (image_buffer[19] << 8);
+            const int iBmpHeight = image_buffer[22] | (image_buffer[23] << 8);
+            bmpNormalizePolarity(image_buffer, image_buffer+62, (iBmpWidth / 8) * iBmpHeight); // palette may be [white, black]
+            flip_image(image_buffer+62, iBmpWidth, iBmpHeight, false); // fix bottom-up bitmap images
 #ifdef BB_EPAPER
+            bbep.setMemoryMode(BB_MODE_1BPP);
             bbep.setBuffer(image_buffer+62); // uncompressed 1-bpp bitmap
 #endif // BB_EPAPER
         }
 #ifdef BB_EPAPER
-#ifndef BOARD_SEEED_RETERMINAL_E1002
-        bbep.writePlane(); // send image data to the EPD
-#endif // !BOARD_SEEED_RETERMINAL_E1002
+        bbep.writePlane(); // send image data to the EPD (converting it if needed to 4/6-clr)
         iRefreshMode = REFRESH_PARTIAL;
 #endif // BB_EPAPER
         iUpdateCount = 1; // use partial update
@@ -1866,7 +2007,7 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait, bool b
         // Seeed Sticky: fast refresh on this panel isn't working and full refresh = fast
         iRefreshMode = REFRESH_FULL;
     }
-    if (!display_update_epaper(iRefreshMode, bWait)) {
+    if (!display_update_epaper(iRefreshMode, bWait, bAlloc)) {
         Log_error("display_show_image: e-paper update failed");
         if (bAlloc) {
             bbep.freeBuffer();
@@ -1959,6 +2100,7 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type, const char *messa
     Log_info("display_show_msg start");
     Log_info("maximum_compatibility = %d\n", apiDisplayResult.response.maximum_compatibility);
 #ifdef BB_EPAPER
+    bbep.setMemoryMode(BB_MODE_1BPP); // use 1-bit mode to save memory
     bbep.allocBuffer(false);
 #else
     bbep.setMode(BB_MODE_1BPP); // message screens are 1-bit
@@ -2471,39 +2613,20 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type, const char *messa
 }
 
 
-void display_show_msg_qa(uint8_t *image_buffer, const float *voltage, const float *temperature, bool qa_result)
+void display_show_msg_qa(const float *voltage, const float *temperature, bool qa_result)
 {
-    auto width = display_width();
-    auto height = display_height();
-    UWORD Imagesize = ((width % 8 == 0) ? (width / 8) : (width / 8 + 1)) * height;
     BB_RECT rect;
 
     Log_info("display_show_msg start");
     Log_info("maximum_compatibility = %d\n", apiDisplayResult.response.maximum_compatibility);
 #ifdef BB_EPAPER
+    bbep.setMemoryMode(BB_MODE_1BPP); // use 1-bit mode to save memory
     bbep.allocBuffer(false);
+    bbep.fillScreen(BBEP_WHITE); // the results go on a blank screen
 #else
     bbep.setMode(BB_MODE_1BPP);
     bbep.setTextColor(BBEP_BLACK, BBEP_WHITE);
 #endif
-    if (*(uint16_t *)image_buffer == BB_BITMAP_MARKER)
-    {
-        // G5 compressed image
-        BB_BITMAP *pBBB = (BB_BITMAP *)image_buffer;
-        int x = (width - pBBB->width)/2;
-        int y = (height - pBBB->height)/2; // center it
-        if (x > 0 || y > 0) // only clear if the image is smaller than the display
-        {
-            bbep.fillScreen(BBEP_WHITE);
-        }
-        bbep.loadG5Image(image_buffer, x, y, BBEP_WHITE, BBEP_BLACK);
-    }
-    else
-    {
-#ifdef BB_EPAPER
-        memcpy(bbep.getBuffer(), image_buffer+62, Imagesize); // uncompressed 1-bpp bitmap
-#endif
-    }
 
     bbep.setFont(nicoclean_8); //Roboto_20);
     bbep.setTextColor(BBEP_BLACK, BBEP_WHITE);
@@ -2589,6 +2712,7 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type, String friendly_i
     Log_info("Free heap in display_show_msg - %" PRIu32, ESP.getMaxAllocHeap());
     Log_info("maximum_compatibility = %d\n", apiDisplayResult.response.maximum_compatibility);
 #ifdef BB_EPAPER
+    bbep.setMemoryMode(BB_MODE_1BPP); // use 1-bit mode to save memory
     bbep.allocBuffer(false);
     Log_info("Free heap after bbep.allocBuffer() - %" PRIu32, ESP.getMaxAllocHeap());
 #else
